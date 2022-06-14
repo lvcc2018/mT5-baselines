@@ -44,7 +44,7 @@ total_steps = len(dataloader['train']) * args.epoch_num
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 loss_func = torch.nn.CrossEntropyLoss()
-scheduler = get_linear_schedule_with_warmup(optimizer, num_training_steps=0.1*total_steps, num_training_steps=total_steps)
+scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*total_steps, num_training_steps=total_steps)
 
 writer = SummaryWriter('logs/mT5_XNLI_lr1e-5')
 
@@ -87,7 +87,7 @@ def evaluate(epoch):
             input_ids, attention_mask, labels = input_ids.to(args.device), attention_mask.to(args.device), labels.to(args.device)
             loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
             epoch_loss += loss.item()
-            writer.add_scalar('valid/loss', epoch_loss, epoch*len(dataloader['valid'] + idx))
+            writer.add_scalar('valid/loss', epoch_loss, epoch*len(dataloader['valid']) + idx)
         epoch_loss /= len(dataloader['valid'])
         print('--------- Eval Epoch {} Loss {} ---------'.format(epoch, epoch_loss))
     return epoch_loss
