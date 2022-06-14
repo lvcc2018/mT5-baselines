@@ -61,9 +61,29 @@ def train(epoch):
 
 def main():
     model.to(args.device)
+    min_loss = 1e10
     for epoch in range(args.epoch_num):
         train(epoch)
         torch.save(model.state_dict(), f'./checkpoints/mT5_{args.dataset}_epoch{epoch}.pt')
+        loss_eval = evaluate(epoch)
+        if loss_eval < min_loss:
+            torch.save(model.state_dict(), f'./checkpoints/mT5_{args.dataset}_best_eval.pt')
+            print("Better checkpoint saved")
+            min_loss = loss_eval
+
+def evaluate(epoch):
+    with torch.no_grad():
+        model.eval()
+        epoch_loss = 0.
+        for idx, data in enumerate(tqdm(dataloader['valid'], desc='Evaluating Epoch {}'.format(epoch))):
+            input_ids, attention_mask, labels = data
+            input_ids, attention_mask, labels = input_ids.to(args.device), attention_mask.to(args.device), labels.to(args.device)
+            loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
+            epoch_loss += loss.item()
+            writer.add_scalar('valid/loss', epoch_loss, epoch*len(dataloader['valid'] + idx))
+        epoch_loss /= len(dataloader['valid'])
+        print('--------- Eval Epoch {} Loss {} ---------'.format(epoch, epoch_loss))
+    return epoch_loss
 
 
 if __name__ == '__main__':
