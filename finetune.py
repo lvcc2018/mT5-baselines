@@ -1,5 +1,7 @@
 import enum
+from sched import scheduler
 from transformers import MT5ForConditionalGeneration, T5Tokenizer
+from transformers import get_linear_schedule_with_warmup
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
@@ -17,8 +19,8 @@ max_source_length = 512
 max_target_length = 128
 
 def preprocess(examples):
-    result = tokenizer(examples['source'], padding="max_length", max_length=max_source_length)
-    result['labels'] = tokenizer(examples['target'], padding="max_length", max_length=max_target_length).input_ids
+    result = tokenizer(examples['source'], padding="max_length", max_length=max_source_length, truncation=True)
+    result['labels'] = tokenizer(examples['target'], padding="max_length", max_length=max_target_length, truncation=True).input_ids
     return result
 
 def collate_fn(batch):
@@ -38,10 +40,13 @@ dataset['valid'] = dataset['valid'].map(preprocess, desc='Tokenizing Valid Datas
 dataset['test'] = dataset['test'].map(preprocess, desc='Tokenizing Test Dataset')
 dataloader = {split: DataLoader(dataset[split], batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn) for split in ['train', 'valid', 'test']}
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5)
-loss_func = torch.nn.CrossEntropyLoss()
+total_steps = len(dataloader['train']) * args.epoch_num
 
-writer = SummaryWriter('logs/mT5_{}'.format(args.data_path))
+optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+loss_func = torch.nn.CrossEntropyLoss()
+scheduler = get_linear_schedule_with_warmup(optimizer, num_training_steps=0.1*total_steps, num_training_steps=total_steps)
+
+writer = SummaryWriter('logs/mT5_XNLI_lr1e-5')
 
 def train(epoch):
     epoch_loss = 0.
@@ -53,9 +58,11 @@ def train(epoch):
         loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
         loss.backward()
         optimizer.step()
+        scheduler.step()
+        optimizer.zero_grad()
         iter_loss = loss.item()
-        epoch_loss += iter_loss()
-        writer.add_scalar('train/loss', iter_loss, epoch*len(dataloader['train'] + idx))
+        epoch_loss += iter_loss
+        writer.add_scalar('train/loss', iter_loss, epoch*len(dataloader['train']) + idx)
     epoch_loss /= len(dataloader['train'])
     print('--------- Epoch {} Loss {} ---------'.format(epoch, epoch_loss))
 
