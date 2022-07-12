@@ -3,6 +3,8 @@ from sched import scheduler
 from transformers import MT5ForConditionalGeneration, T5Tokenizer
 from transformers import get_linear_schedule_with_warmup
 import torch
+import evaluate as eval
+import distutils.version
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from utils import *
@@ -11,16 +13,22 @@ from utils import *
 args = get_args()
 
 dataset = get_dataset(args)
+# dataset = get_all_dataset(args)
 
 tokenizer = T5Tokenizer.from_pretrained("google/mt5-base")
 model = MT5ForConditionalGeneration.from_pretrained("google/mt5-base")
 
-max_source_length = 1024
+max_source_length = 512
 max_target_length = 128
 
 def preprocess(examples):
     result = tokenizer(examples['source'], padding="max_length", max_length=max_source_length, truncation=True)
     result['labels'] = tokenizer(examples['target'], padding="max_length", max_length=max_target_length, truncation=True).input_ids
+    return result
+
+def preprocess_test(examples):
+    result = tokenizer(examples['source'], padding="max_length", max_length=max_source_length, truncation=True)
+    result['labels'] = examples['target']
     return result
 
 def collate_fn(batch):
@@ -31,15 +39,17 @@ def collate_fn(batch):
         input_ids.append(data['input_ids'])
         attention_mask.append(data['attention_mask'])
         labels.append(data['labels'])
-    input_ids, attention_mask, labels = torch.tensor(input_ids), torch.tensor(attention_mask), torch.tensor(labels)
-    labels[labels == tokenizer.pad_token_id] = -100
+    if not isinstance(labels[0], str):
+        labels = torch.tensor(labels)
+        labels[labels == tokenizer.pad_token_id] = -100
+    input_ids, attention_mask = torch.tensor(input_ids), torch.tensor(attention_mask)
     return input_ids, attention_mask, labels
 
 dataset['train'] = dataset['train'].map(preprocess, desc='Tokenizing Train Dataset')
 dataset['valid'] = dataset['valid'].map(preprocess, desc='Tokenizing Valid Dataset')
-dataset['test'] = dataset['test'].map(preprocess, desc='Tokenizing Test Dataset')
-dataloader = {split: DataLoader(dataset[split], batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn) for split in ['train', 'valid']}
-dataloader['test'] = DataLoader(dataset['test'], batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn)
+dataset['test'] = dataset['test'].filter(lambda example: example['language'] == 'fr')
+dataset['test'] = dataset['test'].map(preprocess_test, desc='Tokenizing Test Dataset')
+dataloader = {split: DataLoader(dataset[split], batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn) for split in ['train', 'valid', 'test']}
 
 total_steps = len(dataloader['train']) * args.epoch_num
 
@@ -47,9 +57,10 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
 loss_func = torch.nn.CrossEntropyLoss()
 scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0.1*total_steps, num_training_steps=total_steps)
 
-writer = SummaryWriter('logs/mT5_{}_'.format(args.dataset)+str(args.learning_rate))
+writer = SummaryWriter('logs/mT5_{}'.format(args.dataset))
 
 def train(epoch):
+    epoch_loss = 0.
     iter_loss = 0.
     for idx, data in enumerate(tqdm(dataloader['train'], desc='Training Epoch {}'.format(epoch))):
         model.train()
@@ -61,19 +72,20 @@ def train(epoch):
         scheduler.step()
         optimizer.zero_grad()
         iter_loss = loss.item()
+        epoch_loss += iter_loss
         writer.add_scalar('train/loss', iter_loss, epoch*len(dataloader['train']) + idx)
-    print('--------- Epoch {} Loss {} ---------'.format(epoch, iter_loss))
+    epoch_loss /= len(dataloader['train'])
+    print('--------- Epoch {} Loss {} ---------'.format(epoch, epoch_loss))
 
 def main():
     model.to(args.device)
     min_loss = 1e10
     for epoch in range(args.epoch_num):
         train(epoch)
-        if epoch % 5 == 0:
-            torch.save(model.state_dict(), f'./checkpoints/mT5_{args.learning_rate}_{args.dataset}_epoch{epoch}.pt')
+        torch.save(model.state_dict(), f'./checkpoints/mT5_{args.dataset}_epoch{epoch}.pt')
         loss_eval = evaluate(epoch)
         if loss_eval < min_loss:
-            torch.save(model.state_dict(), f'./checkpoints/mT5_{args.learning_rate}_{args.dataset}_best_eval_pro.pt')
+            torch.save(model.state_dict(), f'./checkpoints/mT5_{args.dataset}_best_eval.pt')
             print("Better checkpoint saved")
             min_loss = loss_eval
 
@@ -85,35 +97,44 @@ def evaluate(epoch):
             input_ids, attention_mask, labels = data
             input_ids, attention_mask, labels = input_ids.to(args.device), attention_mask.to(args.device), labels.to(args.device)
             loss = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels).loss
-            epoch_loss += loss.item()
-            writer.add_scalar('valid/loss', loss.item(), epoch*len(dataloader['valid']) + idx)
+            iter_loss = loss.item()
+            epoch_loss += iter_loss
+            writer.add_scalar('valid/loss', iter_loss, epoch*len(dataloader['valid']) + idx)
         epoch_loss /= len(dataloader['valid'])
         print('--------- Eval Epoch {} Loss {} ---------'.format(epoch, epoch_loss))
     return epoch_loss
 
-
-def inference(args):
-    f = open(f'./result/mT5_{args.learning_rate}_{args.dataset}_best_eval_test.txt','w')
-    model.load_state_dict(torch.load(f'/home/lvcc/mT5-baselines/checkpoints/mT5_1e-05_ALL_best_eval_pro.pt'))
+def generate(epoch):
+    state_dict = torch.load("./checkpoints/mT5_MARC_best_eval.pt", map_location=torch.device('cpu'))
+    model.load_state_dict(state_dict)
     model.to(args.device)
+    allpreds = []
+    alllabels = []
     with torch.no_grad():
-        for idx, data in enumerate(tqdm(dataloader['test'], desc='Inferencing...')):
-            model.eval()
+        model.eval()
+        for idx, data in enumerate(tqdm(dataloader['test'], desc='Testing Epoch {}'.format(epoch))):
             input_ids, attention_mask, labels = data
-            input_ids, attention_mask, labels = input_ids.to(args.device), attention_mask.to(args.device), labels.to(args.device)
-            res = model.generate(inputs=input_ids, max_length=128, top_p=0.9, temperature=0.9)
-            res = tokenizer.batch_decode(res, skip_special_tokens=True)
-            for r in res:
-                f.write("Result:")
-                f.write(r)
-                f.write('\n')
-                f.flush()
+            input_ids, attention_mask= input_ids.to(args.device), attention_mask.to(args.device)
+            outputs = model.generate(input_ids=input_ids, attention_mask=attention_mask)
+            alllabels.extend(labels)
+            allpreds.extend(tokenizer.batch_decode(outputs, skip_special_tokens=True))
+    acc = sum([int(i==j) for i,j in zip(allpreds, alllabels)])/len(allpreds)
+    print(acc)
+    # temp = {'target': alllabels, 'prediction':allpreds}
+    # f = open("pure_all.json", 'w')
+    # json.dump(temp, f, ensure_ascii=False)
 
+def mybleu():
+    bleu = eval.load("bleu")
+    gg = json.load(open('notpure.json', 'r'))
+    results = bleu.compute(predictions=gg['prediction'], references=gg['target'], tokenizer=tokenizer.tokenize, max_order=1)
+    # rouge = eval.load("rouge")
+    # results = rouge.compute(predictions=gg['prediction'], references=gg['target'])
+    print(results)
 
 
 
 if __name__ == '__main__':
-    print(args)
+    # mybleu()
+    generate(0)
     # main()
-    inference(args)
-    
